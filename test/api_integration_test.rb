@@ -459,6 +459,26 @@ class AstockResearchApiIntegrationTest
     report_log = detail["decision_log"].reverse.find { |entry| entry["type"] == "report" }
     assert_equal "汇报 → Leader", report_log["detail"]
   end
+
+  def test_research_is_not_done_until_final_report_exists
+    final_dir = File.join(TEST_DATA, "final-gate")
+    FileUtils.mkdir_p(final_dir)
+    orch = {
+      "mode" => "research", "status" => "running", "stopped_at" => nil,
+      "orchestrator_dir" => final_dir,
+      "tasks" => [{ "name" => "16 最终组合决策", "status" => "done" }]
+    }
+    handler = AstockResearchExt.allocate
+
+    refute handler.send(:mark_orchestration_done_if_terminal!, orch)
+    assert_equal "running", orch["status"]
+    assert_equal nil, orch["stopped_at"]
+
+    File.write(File.join(final_dir, "FINAL_REPORT.md"), "# 最终报告\n")
+    assert handler.send(:mark_orchestration_done_if_terminal!, orch)
+    assert_equal "done", orch["status"]
+    refute orch["stopped_at"].nil?
+  end
 end
 
 if $PROGRAM_NAME == __FILE__

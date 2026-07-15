@@ -69,6 +69,8 @@ class AstockResearchExt < Clacky::ApiExtension
   # Worker text where the same words appear later in the sentence.
   REPORT_DONE_MARKER = "任务已完成".freeze
   TERMINAL_TASK_STATUSES = %w[done superseded].freeze
+  FINAL_REPORT_GRACE_SECONDS = 24
+  FINAL_REPORT_RETRY_MAX = 3
 
   get "/presets" do
     json(analysts: research_presets, pipeline_stages: 7)
@@ -134,12 +136,97 @@ class AstockResearchExt < Clacky::ApiExtension
     name.empty? ? DEFAULT_ORCH_NAME : name
   end
 
-  def mark_orchestration_done_if_terminal!(orch)
+  def research_tasks_terminal?(orch)
     tasks = (orch["tasks"] ||= [])
-    return unless tasks.any? && tasks.all? { |t| terminal_task_status?(t["status"]) }
+    tasks.any? && tasks.all? { |t| terminal_task_status?(t["status"]) }
+  end
+
+  def final_report_path(orch)
+    dir = orch["orchestrator_dir"].to_s
+    dir.empty? ? nil : File.join(dir, "FINAL_REPORT.md")
+  end
+
+  def final_report_ready?(orch)
+    path = final_report_path(orch)
+    path && File.file?(path) && File.size(path).positive?
+  rescue
+    false
+  end
+
+  def mark_orchestration_done_if_terminal!(orch)
+    return false unless research_tasks_terminal?(orch)
+    # In research mode the 16th Worker report is input to the Leader's final
+    # synthesis, not the final deliverable itself. Do not tell the UI that the
+    # project is done until FINAL_REPORT.md actually exists.
+    return false if orch["mode"] == "research" && !final_report_ready?(orch)
+
+    changed = orch["status"] != "done" || orch["stopped_at"].nil?
 
     orch["status"] = "done"
     orch["stopped_at"] ||= Time.now.iso8601
+    orch.delete("final_report_idle_detected_at")
+    orch.delete("final_report_error")
+    changed
+  end
+
+  # Reconcile the short but important final-delivery phase after every fixed
+  # task is done. It also repairs projects created by older versions that were
+  # prematurely marked done before FINAL_REPORT.md was written.
+  def reconcile_final_delivery!(orch)
+    return false unless orch["mode"] == "research" && research_tasks_terminal?(orch)
+    return mark_orchestration_done_if_terminal!(orch) if final_report_ready?(orch)
+
+    changed = false
+    if orch["status"] == "done"
+      orch["status"] = "running"
+      orch["stopped_at"] = nil
+      changed = true
+    end
+
+    leader_status = session_status(orch["orchestrator_session_id"])
+    if leader_status == "running"
+      changed = true if orch.delete("final_report_idle_detected_at")
+      return changed
+    end
+    return changed unless leader_status == "idle"
+
+    now = Time.now
+    first_seen = orch["final_report_idle_detected_at"]
+    if first_seen.to_s.empty?
+      orch["final_report_idle_detected_at"] = now.iso8601
+      return true
+    end
+    return changed if now - Time.parse(first_seen) < FINAL_REPORT_GRACE_SECONDS
+
+    retry_count = orch["final_report_resume_count"].to_i
+    if retry_count < FINAL_REPORT_RETRY_MAX
+      path = final_report_path(orch)
+      prompt = <<~PROMPT
+        【系统自动收尾】16 个固定任务均已完成，但最终交付文件仍不存在：#{path}
+
+        请立即读取各委员报告，尤其是投资组合经理的最终组合决策，生成完整的 `FINAL_REPORT.md` 到团队根目录。不要重新运行已经完成的任务。写入文件后调用 `/decision` 记录最终摘要，并在主会话告知用户文件路径。
+      PROMPT
+      if wake_session(orch["orchestrator_session_id"], prompt,
+          display_message: "自动收尾：生成 FINAL_REPORT.md")
+        orch["final_report_resume_count"] = retry_count + 1
+        orch["last_final_report_resume_at"] = now.iso8601
+        orch.delete("final_report_idle_detected_at")
+        append_log(orch, "system", "final_report_auto_resume",
+          "固定任务已完成但最终报告缺失，自动唤醒主席收尾第 #{retry_count + 1} 次",
+          type: "progress", params: { "retry" => retry_count + 1, "path" => path })
+        changed = true
+      end
+    elsif orch["final_report_error"].to_s.empty?
+      orch["final_report_error"] = "FINAL_REPORT.md 自动收尾已达 #{FINAL_REPORT_RETRY_MAX} 次上限"
+      append_log(orch, "system", "final_report_auto_resume_exhausted",
+        "最终报告自动收尾已达上限，需要人工检查主席模型",
+        type: "error", params: { "path" => final_report_path(orch) })
+      changed = true
+    end
+    changed
+  rescue ArgumentError
+    orch["final_report_idle_detected_at"] = Time.now.iso8601
+    true
   end
 
   def required_json_body!
@@ -597,6 +684,7 @@ class AstockResearchExt < Clacky::ApiExtension
     # or class B escalation to Leader.
     error_handled = detect_and_handle_worker_errors!(orch)
     idle_recovered = recover_idle_running_tasks!(orch)
+    final_delivery_handled = reconcile_final_delivery!(orch)
 
     workers_status = (orch["workers"] || []).map do |w|
       {
@@ -622,7 +710,7 @@ class AstockResearchExt < Clacky::ApiExtension
     if !any_running && orch["status"] != "running" && orch["started_at"] && orch["stopped_at"].nil?
       orch["stopped_at"] = Time.now.iso8601
       save_data(data)
-    elsif error_handled || idle_recovered
+    elsif error_handled || idle_recovered || final_delivery_handled
       save_data(data)
     end
 
