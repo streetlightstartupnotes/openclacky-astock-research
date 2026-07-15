@@ -108,6 +108,15 @@ class AstockResearchExt < Clacky::ApiExtension
     TERMINAL_TASK_STATUSES.include?(status.to_s)
   end
 
+  def orchestration_max_concurrency(orch)
+    value = orch.dig("research", "max_concurrency").to_i
+    AstockResearch::ResearchPresets::ALLOWED_CONCURRENCY.include?(value) ? value : AstockResearch::ResearchPresets::DEFAULT_CONCURRENCY
+  end
+
+  def running_task_count(orch)
+    (orch["tasks"] || []).count { |task| task["status"] == "running" }
+  end
+
   # Map a copied PIPELINE.md label such as "阶段 1 · 01 ..." back to the
   # fixed tasks[].name. This prevents duplicate shadow tasks when an LLM uses
   # the human-readable stage prefix in a progress call.
@@ -170,6 +179,8 @@ class AstockResearchExt < Clacky::ApiExtension
 
     task["status"]  = "done"
     task["done_at"] = Time.now.iso8601
+    task.delete("idle_detected_at")
+    task.delete("auto_resume_exhausted_at")
 
     # Clear current_task so the Worker can receive another assignment.
     if worker_id
@@ -585,6 +596,7 @@ class AstockResearchExt < Clacky::ApiExtension
     # ── Error detection and routing: Worker session error → class A self-heal
     # or class B escalation to Leader.
     error_handled = detect_and_handle_worker_errors!(orch)
+    idle_recovered = recover_idle_running_tasks!(orch)
 
     workers_status = (orch["workers"] || []).map do |w|
       {
@@ -610,7 +622,7 @@ class AstockResearchExt < Clacky::ApiExtension
     if !any_running && orch["status"] != "running" && orch["started_at"] && orch["stopped_at"].nil?
       orch["stopped_at"] = Time.now.iso8601
       save_data(data)
-    elsif error_handled
+    elsif error_handled || idle_recovered
       save_data(data)
     end
 
@@ -639,6 +651,33 @@ class AstockResearchExt < Clacky::ApiExtension
     worker_id = body["worker_id"]
     content   = utf8_text(body["content"]).strip
     error!("content required") if content.empty?
+    from_id     = body["from"].to_s
+    from_role   = body["from_role"].to_s
+    to_leader   = (worker_id == "orchestrator" || worker_id.nil?)
+    from_leader = (from_id == "orchestrator" || from_id.empty?)
+
+    # Some models correctly finish the report but accidentally copy their own
+    # worker_id into the target field. A completion report sent Worker -> self
+    # can never be useful and previously left the task permanently running.
+    # Normalize this narrow, unambiguous mistake to Worker -> Leader.
+    if orch["mode"] == "research" && !from_leader && !to_leader &&
+        worker_id == from_id && content.include?(REPORT_DONE_MARKER)
+      worker_id = "orchestrator"
+      to_leader = true
+    end
+
+    # A Leader assignment is valid only after /progress successfully reserved
+    # a running slot. This closes the race where an LLM ignores a 429 from
+    # /progress and sends the fourth/fifth Worker message anyway.
+    if orch["mode"] == "research" && from_leader && !to_leader
+      assigned = (orch["tasks"] || []).find do |task|
+        task["assigned_to"] == worker_id && task["status"] == "running"
+      end
+      unless assigned
+        error!("worker has no running task; reserve a concurrency slot through /progress first",
+          status: 409, worker_id: worker_id, max_concurrency: orchestration_max_concurrency(orch))
+      end
+    end
 
     target_sid = if worker_id == "orchestrator" || worker_id.nil?
       orch["orchestrator_session_id"]
@@ -666,11 +705,6 @@ class AstockResearchExt < Clacky::ApiExtension
     else
       (orch["workers"] || []).find { |x| x["id"] == worker_id }&.dig("role") || worker_id
     end
-    from_id   = body["from"].to_s
-    from_role = body["from_role"].to_s
-    to_leader = (worker_id == "orchestrator" || worker_id.nil?)
-    from_leader = (from_id == "orchestrator" || from_id.empty?)
-
     log_type = if from_leader && !to_leader
       "dispatch"     # Leader → Worker: assignment
     elsif !from_leader && to_leader
@@ -738,10 +772,20 @@ class AstockResearchExt < Clacky::ApiExtension
     worker_id   = body["worker_id"]
     task_name   = canonical_task_name(orch, body["task"])
     task_status = body["status"].to_s
+    tasks       = (orch["tasks"] ||= [])
+
+    if orch["mode"] == "research" && task_status == "running"
+      existing = tasks.find { |task| task["name"] == task_name }
+      reserving_new_slot = existing.nil? || existing["status"] != "running"
+      limit = orchestration_max_concurrency(orch)
+      if reserving_new_slot && running_task_count(orch) >= limit
+        error!("research concurrency limit reached", status: 429,
+          max_concurrency: limit, running_tasks: running_task_count(orch), task: task_name)
+      end
+    end
 
     if task_status == "superseded"
       error!("task required") if task_name.empty?
-      tasks = (orch["tasks"] ||= [])
       task = tasks.find { |t| t["name"] == task_name }
       error!("task not found", status: 404) unless task
 
@@ -805,7 +849,6 @@ class AstockResearchExt < Clacky::ApiExtension
       json(updated: true, all_done: (orch["status"] == "done"))
     end
 
-    tasks = (orch["tasks"] ||= [])
     task  = tasks.find { |t| t["name"] == task_name }
     if task
       task["status"] = task_status

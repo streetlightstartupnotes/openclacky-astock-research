@@ -1,6 +1,9 @@
 # Domain presets adapted from TradingAgents-Astock's graph and agent roles.
 module AstockResearch
   module ResearchPresets
+    ALLOWED_CONCURRENCY = [2, 3, 5].freeze
+    DEFAULT_CONCURRENCY = 3
+
     ANALYSTS = {
       "market" => {
         role: "市场技术分析师", task: "01 技术面与量价分析",
@@ -66,6 +69,12 @@ module AstockResearch
 
       selected = Array(body["analysts"]).map(&:to_s).select { |key| ANALYSTS.key?(key) }.uniq
       selected = ANALYSTS.keys if selected.empty?
+      max_concurrency = body["max_concurrency"].to_s.strip
+      max_concurrency = DEFAULT_CONCURRENCY if max_concurrency.empty?
+      max_concurrency = max_concurrency.to_i
+      unless ALLOWED_CONCURRENCY.include?(max_concurrency)
+        error!("max_concurrency must be one of 2, 3, 5", status: 422)
+      end
       id = "research_#{SecureRandom.hex(6)}"
       now = Time.now.iso8601
       workers = []
@@ -122,6 +131,7 @@ module AstockResearch
           "trade_date" => trade_date,
           "analysts" => selected,
           "risk_profile" => (body["risk_profile"].to_s.strip.empty? ? "balanced" : body["risk_profile"].to_s),
+          "max_concurrency" => max_concurrency,
           "notes" => body["notes"].to_s.strip,
           "source_project" => "simonlin1212/TradingAgents-astock@e6b32a4f8223dc8c24cbf94fc7343caf6723738a"
         }

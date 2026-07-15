@@ -25,6 +25,8 @@ module AstockResearch
       /unexpected.*token/i
     ].freeze
     AUTO_RETRY_MAX = 2
+    IDLE_RUNNING_GRACE_SECONDS = 24
+    IDLE_RUNNING_RETRY_MAX = 3
 
     # Returns :need_user | :auto_retry
     def classify_error(info)
@@ -102,7 +104,10 @@ module AstockResearch
         else
           # Session is normal (idle/running/unknown). If error_state exists and
           # the session is back to running/idle, self-healing is complete.
-          if w["error_state"] && status != "error"
+          # Watchdog exhaustion is not a transient provider error. Keep it
+          # visible until the user explicitly switches/rebuilds the model;
+          # otherwise the next idle poll would incorrectly declare recovery.
+          if w["error_state"] && status != "error" && w["error_code"] != "idle_resume_exhausted"
             if %w[running idle].include?(status)
               prev_state = w["error_state"]
               append_log(orch, w["role"], "error_recovered",
@@ -128,6 +133,87 @@ module AstockResearch
           end
         end
       end
+      changed
+    end
+
+    # A model turn can end without sending the required Worker -> Leader
+    # completion report. The task then stays `running` while the underlying
+    # session is already `idle`, leaving the whole pipeline stuck forever.
+    #
+    # Poll owns this lightweight watchdog: the first idle observation starts a
+    # grace timer, and a later poll wakes the same Worker with its existing
+    # assignment. Retries are deliberately capped so a broken model/config does
+    # not create an infinite, costly loop.
+    def recover_idle_running_tasks!(orch)
+      return false unless orch["status"] == "running"
+
+      changed = false
+      now = Time.now
+      workers = (orch["workers"] || []).each_with_object({}) { |w, memo| memo[w["id"]] = w }
+
+      (orch["tasks"] || []).each do |task|
+        next unless task["status"] == "running"
+
+        worker = workers[task["assigned_to"]]
+        next unless worker && worker["session_id"]
+        next if worker["error_state"]
+
+        status = session_status(worker["session_id"])
+        if status == "running"
+          changed = true if task.delete("idle_detected_at")
+          next
+        end
+        next unless status == "idle"
+
+        first_seen = task["idle_detected_at"]
+        if first_seen.to_s.empty?
+          task["idle_detected_at"] = now.iso8601
+          changed = true
+          next
+        end
+
+        idle_seconds = now - Time.parse(first_seen)
+        next if idle_seconds < IDLE_RUNNING_GRACE_SECONDS
+
+        retry_count = task["auto_resume_count"].to_i
+        if retry_count < IDLE_RUNNING_RETRY_MAX
+          prompt = <<~PROMPT
+            【系统自动续跑】任务「#{task["name"]}」仍登记为 running，但你的会话已经空闲，说明上一次执行没有完成闭环。
+
+            请从当前工作目录中的已有文件继续，不要从头重复已完成的工作。必须完成本任务产出，并按 system prompt 规定用“任务已完成”开头向主席汇报；不要停在思考、计划或等待状态。
+          PROMPT
+          if wake_session(worker["session_id"], prompt,
+              display_message: "自动续跑：#{task["name"]}")
+            task["auto_resume_count"] = retry_count + 1
+            task["last_auto_resume_at"] = now.iso8601
+            task.delete("idle_detected_at")
+            worker["current_task"] ||= task["name"]
+            append_log(orch, "system", "task_auto_resume",
+              "Worker「#{worker["role"]}」空闲但任务仍在运行，自动续跑第 #{retry_count + 1} 次",
+              type: "progress",
+              params: { "task" => task["name"], "worker" => worker["role"], "retry" => retry_count + 1 })
+            changed = true
+          end
+        elsif task["auto_resume_exhausted_at"].to_s.empty?
+          task["auto_resume_exhausted_at"] = now.iso8601
+          worker["error_state"] = "awaiting_user"
+          worker["error_code"] = "idle_resume_exhausted"
+          worker["error_message"] = "任务自动续跑已达 #{IDLE_RUNNING_RETRY_MAX} 次上限"
+          append_log(orch, "system", "task_auto_resume_exhausted",
+            "Worker「#{worker["role"]}」连续空闲，自动续跑已达上限，需要人工检查模型或数据源",
+            type: "error", params: { "task" => task["name"], "worker" => worker["role"] })
+          leader_sid = orch["orchestrator_session_id"]
+          wake_session(leader_sid,
+            "【系统通知·需汇报用户】任务「#{task["name"]}」已经自动续跑 #{IDLE_RUNNING_RETRY_MAX} 次，" \
+            "Worker「#{worker["role"]}」仍未完成。请向用户说明卡点，停止继续派发依赖任务，等待人工处理。",
+            display_message: "任务自动续跑已达上限") if leader_sid
+          changed = true
+        end
+      rescue ArgumentError
+        task["idle_detected_at"] = now.iso8601
+        changed = true
+      end
+
       changed
     end
   end

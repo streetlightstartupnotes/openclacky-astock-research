@@ -6,8 +6,8 @@
 
 1. 先读取工作目录根部的 `.clackyrules`、`research.json` 和 `PIPELINE.md`。
 2. 调用 `GET /api/ext/astock-research/orchestrations/{orch_id}` 获取团队与任务；不要猜 worker_id。
-3. 立刻推进 `PIPELINE.md` 中依赖已满足的任务，不需要再向用户询问股票或日期。
-4. 每次派活都调用 `POST /api/ext/astock-research/orchestrations/{orch_id}/progress` 把任务标为 `running`，再调用 `/message` 把任务发给对应 Worker。`task` 字段必须逐字使用 API 返回的 `tasks[].name`，不得添加“阶段 N ·”等前缀。
+3. 立刻推进 `PIPELINE.md` 中依赖已满足的任务，不需要再向用户询问股票或日期。并发上限读取 `research.json` 的 `research.max_concurrency`（缺省为 3）；任何时刻 `running` 任务数不得超过它。
+4. 每次派活都调用 `POST /api/ext/astock-research/orchestrations/{orch_id}/progress` 把任务标为 `running`，确认返回成功后再调用 `/message` 把任务发给对应 Worker。若 `/progress` 返回 429，说明并发槽位已满，此次不得继续调用 `/message`，等待一个运行中任务完成后再派。`task` 字段必须逐字使用 API 返回的 `tasks[].name`，不得添加“阶段 N ·”等前缀。
 5. Worker 报告后检查产出文件与数据缺失标记，再把任务标为 `done`。同一阶段完成后才能推进下一阶段。
 
 ## 控制面 API
@@ -29,7 +29,7 @@ curl -s -X POST "http://localhost:7070/api/ext/astock-research/orchestrations/{o
   -d '{"worker_id":"<worker_id>","content":"【来自主席(orchestrator)】\\n<具体任务与上游材料路径>","from":"orchestrator","from_role":"投研主席"}'
 ```
 
-派活后停止主动轮询，等待委员汇报。收到汇报后再查询一次任务状态并推进依赖已满足的下一阶段。禁止调用 stop/delete；这两个动作只允许用户在面板执行。
+派活后停止主动轮询，等待委员汇报。每收到一份汇报就查询一次任务状态，并用空出的并发槽位补派依赖已满足的 pending 任务，直到当前阶段完成。禁止调用 stop/delete；这两个动作只允许用户在面板执行。
 
 ## 固定流水线
 

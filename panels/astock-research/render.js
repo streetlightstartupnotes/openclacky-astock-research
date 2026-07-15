@@ -51,8 +51,13 @@ function createForm() {
         <option value="balanced" ${draft.risk_profile === "balanced" ? "selected" : ""}>均衡</option>
         <option value="aggressive" ${draft.risk_profile === "aggressive" ? "selected" : ""}>进取</option>
       </select></div>
-      <div class="oc-form-group"><label>补充要求</label><textarea class="oc-textarea" id="ar-notes" rows="3" placeholder="持仓背景、关注周期、需要重点验证的问题…">${escapeHtml(draft.notes)}</textarea></div>
+      <div class="oc-form-group"><label>最大并发 Agent</label><select class="oc-select oc-select--full" id="ar-concurrency">
+        <option value="2" ${Number(draft.max_concurrency) === 2 ? "selected" : ""}>2 · 更流畅</option>
+        <option value="3" ${Number(draft.max_concurrency) === 3 ? "selected" : ""}>3 · 推荐</option>
+        <option value="5" ${Number(draft.max_concurrency) === 5 ? "selected" : ""}>5 · 更快但更吃资源</option>
+      </select></div>
     </div>
+    <div class="oc-form-group"><label>补充要求</label><textarea class="oc-textarea" id="ar-notes" rows="3" placeholder="持仓背景、关注周期、需要重点验证的问题…">${escapeHtml(draft.notes)}</textarea></div>
     <div class="oc-form-actions"><button class="oc-btn oc-btn--ghost" id="ar-cancel">取消</button><button class="oc-btn oc-btn--primary" id="ar-create">创建并启动</button></div>
   </div>`;
 }
@@ -68,7 +73,7 @@ function dashboard() {
   return `<div class="ar-dashboard">
     <section class="ar-hero">
       <div><span class="ar-kicker">${escapeHtml(research.trade_date || "A-SHARE RESEARCH")}</span><h2>${escapeHtml(research.ticker || data.name)}</h2><p>${escapeHtml(data.name || "")}</p></div>
-      <div class="ar-hero-actions"><span class="ar-risk">${escapeHtml(research.risk_profile || "balanced")}</span><span id="ar-elapsed" class="oc-timer">${fmtElapsed(state.localElapsed)}</span></div>
+      <div class="ar-hero-actions"><span class="ar-risk">并发 ${escapeHtml(research.max_concurrency || 3)}</span><span class="ar-risk">${escapeHtml(research.risk_profile || "balanced")}</span><span id="ar-elapsed" class="oc-timer">${fmtElapsed(state.localElapsed)}</span></div>
     </section>
     <div class="ar-actions">
       <button class="oc-btn ${running ? "oc-btn--danger" : "oc-btn--primary"}" id="${running ? "ar-stop" : "ar-start"}">${running ? "停止" : (data.status === "done" ? "重新运行" : "启动投研")}</button>

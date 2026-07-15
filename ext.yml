@@ -1,7 +1,7 @@
 id: astock-research
 name: A股投研委员会
 description: 基于 TradingAgents-Astock 的 OpenClacky 原生多 Agent 投研扩展，覆盖七类分析、质量门控、多空辩论、交易计划与三方风控。
-version: 0.2.4
+version: 0.2.5
 author: 路灯同学创业笔记
 origin: self
 contributes:

@@ -27,6 +27,7 @@ export function bindEvents(root, render) {
       research = await apiFetch("/researches", { method: "POST", body: JSON.stringify({
         ticker, trade_date: tradeDate, name: root.querySelector("#ar-name")?.value.trim() || "",
         analysts: state.draft.analysts, risk_profile: root.querySelector("#ar-risk")?.value || "balanced",
+        max_concurrency: Number(root.querySelector("#ar-concurrency")?.value || 3),
         notes: root.querySelector("#ar-notes")?.value.trim() || "", models,
         entry_session_id: state.hostSessionId,
       }) });

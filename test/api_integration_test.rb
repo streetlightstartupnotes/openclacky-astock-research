@@ -236,6 +236,7 @@ class AstockResearchApiIntegrationTest
     assert_equal 7, invoke(:get, "/presets")[1]["analysts"].size
     assert_equal 422, invoke(:post, "/researches", body: valid_research.merge("ticker" => "ABC"))[0]
     assert_equal 422, invoke(:post, "/researches", body: valid_research.merge("trade_date" => "bad"))[0]
+    assert_equal 422, invoke(:post, "/researches", body: valid_research.merge("max_concurrency" => 4))[0]
 
     @http.registry.add("wrongprofile01", profile: "general", working_dir: @workspace)
     wrong = valid_research.merge("entry_session_id" => "wrongprofile01")
@@ -248,6 +249,7 @@ class AstockResearchApiIntegrationTest
     orch_id = orch.fetch("id")
     assert_equal @entry_id, orch["orchestrator_session_id"]
     assert_equal 10, orch["workers"].size
+    assert_equal 3, orch.dig("research", "max_concurrency")
 
     # One public session owns one project.
     assert_equal 409, invoke(:post, "/researches", body: valid_research)[0]
@@ -351,6 +353,111 @@ class AstockResearchApiIntegrationTest
     summary = AstockResearchExt.allocate.send(:msg_summary, invalid)
     assert summary.valid_encoding?
     assert_includes summary, "任务：技术面分析"
+  end
+
+  def test_research_concurrency_limit_blocks_extra_progress_and_dispatch
+    body = valid_research.merge(
+      "analysts" => %w[market social news],
+      "max_concurrency" => 2
+    )
+    create_status, orch = invoke(:post, "/researches", body: body)
+    assert_equal 200, create_status
+    orch_id = orch["id"]
+    assert_equal 2, orch.dig("research", "max_concurrency")
+    assert_equal 200, invoke(:post, "/orchestrations/:id/start", params: { id: orch_id })[0]
+
+    stage_one = orch["tasks"].select { |task| task["stage"] == 1 }
+    stage_one.first(2).each do |task|
+      assert_equal 200, invoke(:post, "/orchestrations/:id/progress",
+        params: { id: orch_id },
+        body: { "worker_id" => task["assigned_to"], "task" => task["name"], "status" => "running" })[0]
+      assert_equal 200, invoke(:post, "/orchestrations/:id/message",
+        params: { id: orch_id },
+        body: { "worker_id" => task["assigned_to"], "content" => "执行 #{task["name"]}", "from" => "orchestrator" })[0]
+    end
+
+    blocked = stage_one.fetch(2)
+    progress_status, progress_body = invoke(:post, "/orchestrations/:id/progress",
+      params: { id: orch_id },
+      body: { "worker_id" => blocked["assigned_to"], "task" => blocked["name"], "status" => "running" })
+    assert_equal 429, progress_status
+    assert_equal 2, progress_body["max_concurrency"]
+    assert_equal 2, progress_body["running_tasks"]
+
+    # Even if a Leader ignores the 429 response, /message refuses to wake a
+    # Worker that does not own a successfully reserved running task.
+    assert_equal 409, invoke(:post, "/orchestrations/:id/message",
+      params: { id: orch_id },
+      body: { "worker_id" => blocked["assigned_to"], "content" => "错误的超额派活", "from" => "orchestrator" })[0]
+    assert_equal 3, @http.runs.size # one Leader kickoff + two Worker dispatches
+  end
+
+  def test_poll_watchdog_resumes_idle_worker_with_running_task
+    orch = create_research
+    orch_id = orch["id"]
+    start_status, started = invoke(:post, "/orchestrations/:id/start", params: { id: orch_id })
+    assert_equal 200, start_status
+    task = started["tasks"].find { |candidate| candidate["stage"] == 1 }
+    worker = started["workers"].find { |candidate| candidate["id"] == task["assigned_to"] }
+    assert_equal 200, invoke(:post, "/orchestrations/:id/progress",
+      params: { id: orch_id },
+      body: { "worker_id" => worker["id"], "task" => task["name"], "status" => "running" })[0]
+
+    persisted = JSON.parse(File.read(AstockResearch::DataStore::DATA_FILE))
+    stored_task = persisted.dig("orchestrations", orch_id, "tasks").find { |candidate| candidate["id"] == task["id"] }
+    stored_task["idle_detected_at"] = (Time.now - 60).iso8601
+    File.write(AstockResearch::DataStore::DATA_FILE, JSON.pretty_generate(persisted))
+
+    poll_status, poll = invoke(:get, "/orchestrations/:id/poll", params: { id: orch_id })
+    assert_equal 200, poll_status
+    assert_equal "running", poll["tasks"].find { |candidate| candidate["id"] == task["id"] }["status"]
+    assert_equal worker["session_id"], @http.runs.last[:id]
+    assert_includes @http.runs.last[:prompt], "系统自动续跑"
+    assert_includes @http.runs.last[:prompt], "任务已完成"
+
+    saved = JSON.parse(File.read(AstockResearch::DataStore::DATA_FILE))
+    resumed = saved.dig("orchestrations", orch_id, "tasks").find { |candidate| candidate["id"] == task["id"] }
+    assert_equal 1, resumed["auto_resume_count"]
+    assert saved.dig("orchestrations", orch_id, "decision_log").any? { |entry| entry["action"] == "task_auto_resume" }
+
+    # The cap must remain visible across later idle polls; it must not be
+    # mistaken for a provider error that healed merely because the session is idle.
+    resumed["auto_resume_count"] = 3
+    resumed["idle_detected_at"] = (Time.now - 60).iso8601
+    resumed.delete("auto_resume_exhausted_at")
+    File.write(AstockResearch::DataStore::DATA_FILE, JSON.pretty_generate(saved))
+    assert_equal 200, invoke(:get, "/orchestrations/:id/poll", params: { id: orch_id })[0]
+    later_poll = invoke(:get, "/orchestrations/:id/poll", params: { id: orch_id })[1]
+    stalled_worker = later_poll["workers"].find { |candidate| candidate["id"] == worker["id"] }
+    assert_equal "awaiting_user", stalled_worker["error_state"]
+    assert_equal "idle_resume_exhausted", stalled_worker["error_code"]
+  end
+
+  def test_worker_completion_accidentally_sent_to_self_is_rerouted_to_leader
+    orch = create_research
+    orch_id = orch["id"]
+    start_status, started = invoke(:post, "/orchestrations/:id/start", params: { id: orch_id })
+    assert_equal 200, start_status
+    task = started["tasks"].find { |candidate| candidate["stage"] == 1 }
+    worker = started["workers"].find { |candidate| candidate["id"] == task["assigned_to"] }
+    assert_equal 200, invoke(:post, "/orchestrations/:id/progress",
+      params: { id: orch_id },
+      body: { "worker_id" => worker["id"], "task" => task["name"], "status" => "running" })[0]
+
+    # This is the exact malformed payload observed in the live 002230 run:
+    # sender and target are both the same Worker even though it is a completion report.
+    assert_equal 200, invoke(:post, "/orchestrations/:id/message",
+      params: { id: orch_id },
+      body: {
+        "worker_id" => worker["id"], "from" => worker["id"], "from_role" => worker["role"],
+        "content" => "任务已完成。报告已写入 REPORT.md。"
+      })[0]
+
+    detail = invoke(:get, "/orchestrations/:id", params: { id: orch_id })[1]
+    assert_equal "done", detail["tasks"].find { |candidate| candidate["id"] == task["id"] }["status"]
+    assert_equal @entry_id, @http.runs.last[:id]
+    report_log = detail["decision_log"].reverse.find { |entry| entry["type"] == "report" }
+    assert_equal "汇报 → Leader", report_log["detail"]
   end
 end
 

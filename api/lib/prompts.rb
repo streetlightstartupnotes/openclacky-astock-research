@@ -21,9 +21,10 @@ module AstockResearch
           标的：#{research["ticker"]}
           研究截止日：#{research["trade_date"]}
           风险偏好：#{research["risk_profile"]}
+          最大并发 Agent：#{research["max_concurrency"] || 3}
           补充要求：#{research["notes"].to_s.empty? ? "无" : research["notes"]}
 
-          立即读取 `.clackyrules`、`research.json` 与 `PIPELINE.md`，查询团队和任务，按依赖关系启动第一阶段分析师任务。无需再次询问用户目标，不得跳过数据质量、多空、交易和三方风险阶段。最终生成 `FINAL_REPORT.md`。
+          立即读取 `.clackyrules`、`research.json` 与 `PIPELINE.md`，查询团队和任务，按依赖关系启动第一阶段分析师任务，同时运行的任务不得超过上述最大并发数。无需再次询问用户目标，不得跳过数据质量、多空、交易和三方风险阶段。最终生成 `FINAL_REPORT.md`。
         PROMPT
       end
 

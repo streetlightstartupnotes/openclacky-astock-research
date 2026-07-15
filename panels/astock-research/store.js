@@ -4,10 +4,11 @@ const today = new Date().toISOString().slice(0, 10);
 export const state = {
   orchestrations: [], activeId: null, current: null, visible: false,
   hostSessionId: null, hostAgentProfile: null,
-  pollTimer: null, pollInterval: 4000, tickTimer: null, localElapsed: 0,
+  pollTimer: null, pollInterval: 8000, tickTimer: null, localElapsed: 0,
+  lastPollSignature: null,
   creating: false, presets: [], models: [], defaultModelId: null,
   draft: {
-    ticker: "", trade_date: today, name: "", risk_profile: "balanced", notes: "",
+    ticker: "", trade_date: today, name: "", risk_profile: "balanced", max_concurrency: 3, notes: "",
     analysts: ["market", "social", "news", "fundamentals", "policy", "hot_money", "lockup"],
     quick_model: "", deep_model: "",
   },
@@ -43,6 +44,7 @@ export function setHostContext(ctx = {}) {
     state.activeId = null;
     state.current = null;
     state.localElapsed = 0;
+    state.lastPollSignature = null;
     stopPoll();
     stopTick();
   }
@@ -79,10 +81,24 @@ export async function pollActive() {
   if (!state.activeId || !state.visible) return;
   try {
     const data = await apiFetch(`/orchestrations/${state.activeId}/poll`);
+    // The elapsed timer is updated locally once per second. Ignore it when
+    // deciding whether to rebuild the whole panel; only structural state
+    // changes should replace DOM.
+    const signature = JSON.stringify({
+      id: data.id,
+      status: data.status,
+      orchestrator_status: data.orchestrator_status,
+      research: data.research,
+      workers: data.workers,
+      tasks: data.tasks,
+      decision_log: data.decision_log,
+    });
+    const shouldRender = signature !== state.lastPollSignature;
     state.current = data;
+    state.lastPollSignature = signature;
     if (typeof data.elapsed_seconds === "number") state.localElapsed = data.elapsed_seconds;
     if (data.status === "running") startTick(); else stopTick();
-    emit();
+    if (shouldRender) emit();
   } catch (error) { console.debug("[astock-research] poll failed", error); }
 }
 
