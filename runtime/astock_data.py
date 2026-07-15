@@ -115,7 +115,7 @@ def run_bundle(api, role: str, ticker: str, date: str, days: int) -> str:
 
 def build_parser():
     parser = argparse.ArgumentParser(description="TradingAgents-Astock 数据层的 OpenClacky CLI 桥")
-    parser.add_argument("--version", action="version", version="astock-data 0.2.5 / upstream 0.2.18")
+    parser.add_argument("--version", action="version", version="astock-data 0.2.6 / upstream 0.2.18")
     sub = parser.add_subparsers(dest="command", required=True)
 
     check = sub.add_parser("check", help="检查运行依赖")
