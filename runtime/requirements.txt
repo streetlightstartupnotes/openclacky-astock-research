@@ -1,0 +1,9 @@
+pandas>=2.3.0
+python-dateutil>=2.9.0
+requests>=2.32.4
+# macOS system Python 3.9 is linked against LibreSSL; urllib3 2.x rejects that
+# TLS backend. Keep the isolated extension runtime on the maintained 1.26 line.
+urllib3>=1.26.20,<2.0
+mootdx>=0.10.0
+stockstats>=0.6.5
+parsel>=1.10.0

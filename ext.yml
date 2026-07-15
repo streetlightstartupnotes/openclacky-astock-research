@@ -1,0 +1,24 @@
+id: astock-research
+name: A股投研委员会
+description: 基于 TradingAgents-Astock 的 OpenClacky 原生多 Agent 投研扩展，覆盖七类分析、质量门控、多空辩论、交易计划与三方风控。
+version: 0.2.4
+author: 路灯同学创业笔记
+origin: self
+contributes:
+  api: api/handler.rb
+  panels:
+    - id: astock-research
+      title: A-Share Research
+      title_zh: A股投研
+      description: Create and monitor a multi-agent A-share research project in the current session.
+      description_zh: 在当前会话中创建并监控多 Agent A 股投研项目。
+      view: panels/astock-research/view.js
+      attach: [astock-research]
+  agents:
+    - id: astock-research
+      title: A-Share Research Assistant
+      title_zh: A股投研助手
+      description: 创建并管理 A 股多 Agent 投研项目；当前会话作为项目总控，后台自动调度专项研究角色。
+      description_zh: 创建并管理 A 股多 Agent 投研项目；当前会话作为项目总控，后台自动调度专项研究角色。
+      prompt: agents/astock-research/system_prompt.md
+      panels: [astock-research]
